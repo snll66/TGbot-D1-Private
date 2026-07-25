@@ -91,6 +91,14 @@ async function ensureBotCommands(env) {
         {
           command: 'admin',
           description: '管理命令（指纹标签/黑名单）'
+        },
+        {
+          command: 'testverify',
+          description: '测试验证流程 /testverify 用户ID'
+        },
+        {
+          command: 'reset',
+          description: '重置用户验证 /reset 用户ID'
         }
       ]
     }
@@ -549,6 +557,13 @@ async function dbMigrate(env) {
     )
     `,
     `
+    CREATE TABLE IF NOT EXISTS banned_ips (
+      ip TEXT PRIMARY KEY NOT NULL,
+      reason TEXT,
+      created_at INTEGER NOT NULL
+    )
+    `,
+    `
     CREATE INDEX IF NOT EXISTS idx_users_topic_id
     ON users(topic_id)
     `,
@@ -596,6 +611,28 @@ async function dbMigrate(env) {
     'topic_lock_at',
     'INTEGER'
   );
+
+  // 指纹去重：清理同一 user_id 的重复记录，只保留最新一条（id 最大）
+  // 然后创建唯一索引，从数据库层面杜绝重复
+  try {
+    await env.TG_BOT_DB.prepare(
+      `DELETE FROM fingerprints
+       WHERE id NOT IN (
+         SELECT MAX(id) FROM fingerprints GROUP BY user_id
+       )`
+    ).run();
+  } catch (e) {
+    console.error('清理重复指纹失败：', e?.message || e);
+  }
+
+  try {
+    await env.TG_BOT_DB.prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprints_user_unique
+       ON fingerprints(user_id)`
+    ).run();
+  } catch (e) {
+    console.error('创建指纹唯一索引失败：', e?.message || e);
+  }
 }
 
 async function ensureMigration(env) {
@@ -921,44 +958,28 @@ async function dbInsertFingerprint(
     Date.now() / 1000
   );
 
-  // 去重：同用户 + 同设备指纹已存在则复用，避免重复记录堆积
-  const existing = await env.TG_BOT_DB.prepare(
-    'SELECT id FROM fingerprints WHERE user_id = ? AND device_hash = ? ORDER BY created_at DESC LIMIT 1'
-  )
-    .bind(data.user_id, data.device_hash)
-    .first();
-
-  if (existing) {
-    // IP/ASN 可能变化，更新最新网络信息
-    await env.TG_BOT_DB.prepare(
-      `UPDATE fingerprints
-       SET pub_ip = ?, pub_asn = ?, pub_isp = ?,
-           webrtc_ip = ?, webrtc_asn = ?, webrtc_isp = ?,
-           created_at = ?
-       WHERE id = ?`
-    )
-      .bind(
-        data.pub_ip ?? null,
-        data.pub_asn ?? null,
-        data.pub_isp ?? null,
-        data.webrtc_ip ?? null,
-        data.webrtc_asn ?? null,
-        data.webrtc_isp ?? null,
-        now,
-        existing.id
-      )
-      .run();
-    return existing.id;
-  }
-
-  const res = await env.TG_BOT_DB.prepare(
+  // 原子 upsert：依赖 user_id 唯一索引，同一用户只保留一条指纹记录
+  // 彻底解决并发请求导致的重复插入问题（SELECT-then-INSERT 有竞态）
+  const row = await env.TG_BOT_DB.prepare(
     `INSERT INTO fingerprints
        (user_id, session_id, pub_ip, pub_asn, pub_isp,
         webrtc_ip, webrtc_asn, webrtc_isp, device_json, device_hash, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       session_id = excluded.session_id,
+       pub_ip = excluded.pub_ip,
+       pub_asn = excluded.pub_asn,
+       pub_isp = excluded.pub_isp,
+       webrtc_ip = excluded.webrtc_ip,
+       webrtc_asn = excluded.webrtc_asn,
+       webrtc_isp = excluded.webrtc_isp,
+       device_json = excluded.device_json,
+       device_hash = excluded.device_hash,
+       created_at = excluded.created_at
+     RETURNING id`
   )
     .bind(
-      data.user_id,
+      String(data.user_id),
       data.session_id,
       data.pub_ip ?? null,
       data.pub_asn ?? null,
@@ -970,8 +991,9 @@ async function dbInsertFingerprint(
       data.device_hash,
       now
     )
-    .run();
-  return res.meta.last_row_id;
+    .first();
+
+  return row?.id || null;
 }
 
 async function dbGetLatestFingerprint(
@@ -1085,6 +1107,63 @@ async function dbIsBlacklisted(env, userId) {
   )
     .bind(String(userId))
     .first();
+  return Boolean(row);
+}
+
+/* -------------------------- 封禁 IP 管理 -------------------------- */
+
+async function dbBannedIpAdd(
+  env,
+  ip,
+  reason = ''
+) {
+  const now = Math.floor(
+    Date.now() / 1000
+  );
+  await env.TG_BOT_DB.prepare(
+    `INSERT INTO banned_ips (ip, reason, created_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(ip)
+     DO UPDATE SET reason = excluded.reason,
+                   created_at = excluded.created_at`
+  )
+    .bind(
+      String(ip).trim(),
+      reason,
+      now
+    )
+    .run();
+}
+
+async function dbBannedIpRemove(env, ip) {
+  await env.TG_BOT_DB.prepare(
+    'DELETE FROM banned_ips WHERE ip = ?'
+  )
+    .bind(String(ip).trim())
+    .run();
+}
+
+async function dbBannedIpList(
+  env,
+  limit = 100
+) {
+  const { results } =
+    await env.TG_BOT_DB.prepare(
+      'SELECT * FROM banned_ips ORDER BY created_at DESC LIMIT ?'
+    )
+      .bind(limit)
+      .all();
+  return results || [];
+}
+
+async function dbIsIpBanned(env, ip) {
+  if (!ip) return false;
+  const row =
+    await env.TG_BOT_DB.prepare(
+      'SELECT 1 FROM banned_ips WHERE ip = ?'
+    )
+      .bind(String(ip).trim())
+      .first();
   return Boolean(row);
 }
 
@@ -4350,6 +4429,124 @@ async function handlePrivateMessage(
       return;
     }
 
+    // /admin banip <IP> [原因] - 添加封禁 IP
+    if (sub === 'banip') {
+      const ip = (parts[2] || '').trim();
+      const reason =
+        parts.slice(3).join(' ').trim() ||
+        '管理员手动封禁';
+
+      if (!ip) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text:
+              '⚠️ 用法：/admin banip <IP> [原因]\n' +
+              '例如：/admin banip 1.2.3.4 VPN恶意用户\n\n' +
+              '封禁后，公网 IP 或 WebRTC IP 命中该 IP 的用户，' +
+              '验证完成时将被直接封禁。'
+          }
+        );
+        return;
+      }
+
+      await dbBannedIpAdd(env, ip, reason);
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text:
+            `✅ 已封禁 IP <code>${escapeHtml(
+              ip
+            )}</code>\n` +
+            `原因：${escapeHtml(reason)}\n\n` +
+            `该 IP 的用户验证完成时将被自动封禁。`,
+          parse_mode: 'HTML'
+        }
+      );
+      return;
+    }
+
+    // /admin unbanip <IP> - 解除 IP 封禁
+    if (sub === 'unbanip') {
+      const ip = (parts[2] || '').trim();
+
+      if (!ip) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text: '⚠️ 用法：/admin unbanip <IP>'
+          }
+        );
+        return;
+      }
+
+      await dbBannedIpRemove(env, ip);
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: `✅ 已解除 IP <code>${escapeHtml(
+            ip
+          )}</code> 的封禁。`,
+          parse_mode: 'HTML'
+        }
+      );
+      return;
+    }
+
+    // /admin baniplist - 查看封禁 IP 列表
+    if (sub === 'baniplist') {
+      const list = await dbBannedIpList(env);
+
+      if (!list.length) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text: '📭 封禁 IP 列表为空。'
+          }
+        );
+        return;
+      }
+
+      let text =
+        `📋 <b>封禁 IP（共 ${list.length}）</b>\n\n`;
+      for (const b of list) {
+        text +=
+          `• <code>${escapeHtml(
+            b.ip
+          )}</code> ` +
+          `${escapeHtml(b.reason || '')} ` +
+          `${escapeHtml(
+            formatTimestamp(b.created_at)
+          )}\n`;
+      }
+
+      text +=
+        '\n解除：/admin unbanip <IP>';
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML'
+        }
+      );
+      return;
+    }
+
     // 无子命令：显示用法
     await telegramApi(
       env.BOT_TOKEN,
@@ -4365,7 +4562,13 @@ async function handlePrivateMessage(
           '• <code>/admin tags &lt;指纹ID&gt;</code> ' +
           '查看指纹标签\n' +
           '• <code>/admin blacklist</code> ' +
-          '查看黑名单\n\n' +
+          '查看黑名单\n' +
+          '• <code>/admin banip &lt;IP&gt; [原因]</code> ' +
+          '封禁 IP（验证时命中直接封禁）\n' +
+          '• <code>/admin unbanip &lt;IP&gt;</code> ' +
+          '解除 IP 封禁\n' +
+          '• <code>/admin baniplist</code> ' +
+          '查看封禁 IP 列表\n\n' +
           '提示：用 <code>/fplist</code> 获取指纹 ID。\n' +
           '标签含 block/ban/黑名单/封禁 时，' +
           '验证阶段会自动拦截相似指纹。',
@@ -4667,6 +4870,192 @@ async function handleAdminCommand(
     return false;
   }
 
+  const senderId =
+    String(message.from?.id || '');
+
+  const isAdmin =
+    await isAdminUser(senderId, env);
+
+  if (!isAdmin) {
+    return true;
+  }
+
+  const chatId =
+    String(message.chat?.id || '');
+
+  // /testverify [用户ID] - 测试验证流程（仅主管理员）
+  // 无参数：重置自身验证状态进入测试模式
+  // 有参数：重置指定用户的验证状态，使其下次发消息时重新触发验证
+  if (parsed.command === 'testverify') {
+    const isPrimary =
+      isPrimaryAdmin(senderId, env);
+
+    if (!isPrimary) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: '⚠️ 此命令仅限主管理员使用。'
+        }
+      );
+      return true;
+    }
+
+    const targetUserId =
+      parsed.argument || senderId;
+
+    if (!/^\d+$/.test(targetUserId)) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: '⚠️ 用户 ID 必须为纯数字。\n用法：/testverify [用户ID]'
+        }
+      );
+      return true;
+    }
+
+    // 设置测试模式标记
+    await setConfig(
+      `test_verify_${targetUserId}`,
+      '1',
+      env
+    );
+
+    // 重置用户状态为 NEW
+    await dbUserUpdate(
+      String(targetUserId),
+      { user_state: USER_STATE.NEW },
+      env
+    );
+
+    const isSelf =
+      String(targetUserId) ===
+      String(senderId);
+
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text: isSelf
+          ? '🔧 已进入验证测试模式，您的验证状态已重置。接下来将显示验证流程，验证完成后自动退出测试模式。'
+          : `🔧 已重置用户 <code>${escapeHtml(
+              targetUserId
+            )}</code> 的验证状态（测试模式）。该用户下次发消息时将重新触发验证流程。`,
+        parse_mode: 'HTML'
+      }
+    );
+
+    if (isSelf) {
+      await handleStart(chatId, env);
+    }
+
+    return true;
+  }
+
+  // /reset <用户ID> - 重置用户验证状态（仅主管理员）
+  if (parsed.command === 'reset') {
+    const isPrimary =
+      isPrimaryAdmin(senderId, env);
+
+    if (!isPrimary) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: '⚠️ 此命令仅限主管理员使用。'
+        }
+      );
+      return true;
+    }
+
+    const targetUserId =
+      parsed.argument;
+
+    if (!targetUserId) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text:
+            '⚠️ 用法：/reset <用户ID>\n' +
+            '例如：/reset 8215842959\n\n' +
+            '重置后该用户需要重新验证。'
+        }
+      );
+      return true;
+    }
+
+    if (!/^\d+$/.test(targetUserId)) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: '⚠️ 用户 ID 必须为纯数字。'
+        }
+      );
+      return true;
+    }
+
+    const targetUser =
+      await dbUserGet(
+        String(targetUserId),
+        env
+      );
+
+    if (!targetUser) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: `❌ 用户 ${escapeHtml(targetUserId)} 不存在。`
+        }
+      );
+      return true;
+    }
+
+    await dbUserUpdate(
+      String(targetUserId),
+      {
+        user_state: USER_STATE.NEW,
+        is_blocked: false
+      },
+      env
+    );
+
+    // 清除测试模式标记
+    await setConfig(
+      `test_verify_${targetUserId}`,
+      '',
+      env
+    );
+
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text:
+          `✅ 已重置用户 <code>${escapeHtml(
+            targetUserId
+          )}</code> 的验证状态。\n` +
+          `该用户下次发消息时将重新触发验证流程。\n\n` +
+          `查看指纹：/fp ${escapeHtml(
+            targetUserId
+          )}`,
+        parse_mode: 'HTML'
+      }
+    );
+    return true;
+  }
+
   const allowedCommands = new Set([
   'ban',
   'unban',
@@ -4677,16 +5066,6 @@ async function handleAdminCommand(
 
   if (!allowedCommands.has(parsed.command)) {
     return false;
-  }
-
-  const senderId =
-    String(message.from?.id || '');
-
-  const isAdmin =
-    await isAdminUser(senderId, env);
-
-  if (!isAdmin) {
-    return true;
   }
 
   const topicId = String(
@@ -6964,6 +7343,69 @@ async function handleVerifySubmit(
     webrtcIp && pubIp && webrtcIp === pubIp
       ? pubIsp
       : null;
+
+  // 4.5 IP 封禁检查：公网 IP 或 WebRTC IP 命中封禁列表 → 验证完直接封禁
+  let blockedByIp = false;
+  let bannedIpHit = null;
+  try {
+    if (pubIp && await dbIsIpBanned(env, pubIp)) {
+      blockedByIp = true;
+      bannedIpHit = pubIp;
+    } else if (webrtcIp && webrtcIp !== pubIp && await dbIsIpBanned(env, webrtcIp)) {
+      blockedByIp = true;
+      bannedIpHit = webrtcIp;
+    }
+  } catch (e) {
+    console.error('IP 封禁检查失败：', e?.message || e);
+  }
+
+  if (blockedByIp) {
+    await dbUpdateVerifySession(
+      env,
+      sessionId,
+      'failed',
+      null
+    );
+
+    await dbUserUpdate(
+      session.user_id,
+      {
+        is_blocked: true,
+        user_state: USER_STATE.NEW
+      },
+      env
+    );
+
+    try {
+      await dbBlacklistAdd(
+        env,
+        session.user_id,
+        `IP 命中封禁列表 (${bannedIpHit})`,
+        'ip_ban'
+      );
+    } catch (e) {
+      console.error('写入黑名单失败：', e?.message || e);
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: session.user_id,
+          text:
+            '❌ 验证未通过，系统检测到异常，请联系管理员。'
+        }
+      );
+    } catch (e) {
+      console.error('通知用户拦截失败：', e?.message || e);
+    }
+
+    return jsonResponse(
+      { ok: false, error: '验证未通过' },
+      403
+    );
+  }
 
   // 5. 写入指纹
   const fpId = await dbInsertFingerprint(env, {
