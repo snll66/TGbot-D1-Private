@@ -894,9 +894,37 @@ async function listFingerprints(
     tagMap.get(t.fingerprint_id).push(t);
   }
 
+  // 批量查询关联用户信息（昵称、用户名）
+  const userIds = [
+    ...new Set(
+      fingerprints.map((f) => f.user_id)
+    )
+  ];
+  const userPlaceholders = userIds
+    .map(() => '?')
+    .join(',');
+  const { results: users } =
+    await env.TG_BOT_DB.prepare(
+      `SELECT user_id, user_info_json FROM users WHERE user_id IN (${userPlaceholders})`
+    )
+      .bind(...userIds)
+      .all();
+
+  const userMap = new Map();
+  for (const u of users) {
+    let info = null;
+    try {
+      info = u.user_info_json
+        ? JSON.parse(u.user_info_json)
+        : null;
+    } catch {}
+    userMap.set(u.user_id, info || {});
+  }
+
   return fingerprints.map((f) => ({
     fingerprint: f,
-    tags: tagMap.get(f.id) || []
+    tags: tagMap.get(f.id) || [],
+    userInfo: userMap.get(f.user_id) || {}
   }));
 }
 
@@ -2985,7 +3013,7 @@ async function showMainMenu(
     inline_keyboard: [
       [
         {
-          text: '📝 基础配置（验证问答）',
+          text: '📝 基础配置',
           callback_data:
             'config:menu:base'
         }
@@ -3052,7 +3080,7 @@ async function showBaseMenu(
     await getConfig('verif_a', env);
 
   const text = `
-⚙️ <b>基础配置（人机验证）</b>
+⚙️ <b>基础配置</b>
 
 <b>当前设置：</b>
 • 欢迎消息：${escapeHtml(welcomeMsg).slice(0, 30)}${welcomeMsg.length > 30 ? '…' : ''}
@@ -4114,6 +4142,8 @@ async function handlePrivateMessage(
         `<b>用户 ID:</b> <code>${escapeHtml(
           String(h.fingerprint.user_id)
         )}</code>\n` +
+        `<b>昵称:</b> ${escapeHtml(h.userInfo?.name || '未知')}\n` +
+        `<b>用户名:</b> ${escapeHtml(h.userInfo?.username || '无')}\n` +
         `<b>系统:</b> ${escapeHtml(dev.os || 'N/A')}\n` +
         `<b>公网 IP:</b> <code>${escapeHtml(
           h.fingerprint.pub_ip || 'N/A'
