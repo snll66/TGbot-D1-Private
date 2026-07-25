@@ -80,14 +80,18 @@ async function ensureBotCommands(env) {
           command: 'delete',
           description: '删除被回复的消息'
         },
-{
-  command: 'terminate',
-  description: '删除当前用户话题'
-},
-{
-  command: 'card',
-  description: '重新创建当前用户资料卡'
-}
+        {
+          command: 'terminate',
+          description: '删除当前用户话题'
+        },
+        {
+          command: 'card',
+          description: '重新创建当前用户资料卡'
+        },
+        {
+          command: 'admin',
+          description: '管理命令（指纹标签/黑名单）'
+        }
       ]
     }
   ).catch((error) => {
@@ -143,12 +147,13 @@ function toBoolText(value, defaultValue = true) {
 }
 
 function formatTimestamp(timestamp) {
-  if (!timestamp) return '[]';
+  // 修复：原代码对 0/空值返回字面量 '[]'，显示不友好
+  if (!timestamp) return '未知';
 
   const date = new Date(Number(timestamp) * 1000);
 
   if (Number.isNaN(date.getTime())) {
-    return '[]';
+    return '未知';
   }
 
   return date.toLocaleString('zh-CN', {
@@ -532,6 +537,14 @@ async function dbMigrate(env) {
       fingerprint_id INTEGER NOT NULL,
       tag TEXT NOT NULL,
       note TEXT,
+      created_at INTEGER NOT NULL
+    )
+    `,
+    `
+    CREATE TABLE IF NOT EXISTS blacklist (
+      user_id TEXT PRIMARY KEY NOT NULL,
+      reason TEXT,
+      source TEXT,
       created_at INTEGER NOT NULL
     )
     `,
@@ -991,6 +1004,53 @@ async function dbGetFingerprintById(
   )
     .bind(fpId)
     .first();
+}
+
+/* ---------- 黑名单 DB 操作 ---------- */
+
+async function dbBlacklistAdd(
+  env,
+  userId,
+  reason = '',
+  source = 'manual'
+) {
+  const now = Math.floor(Date.now() / 1000);
+  await env.TG_BOT_DB.prepare(
+    `INSERT INTO blacklist (user_id, reason, source, created_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id)
+     DO UPDATE SET reason = excluded.reason,
+                   source = excluded.source,
+                   created_at = excluded.created_at`
+  )
+    .bind(String(userId), reason, source, now)
+    .run();
+}
+
+async function dbBlacklistRemove(env, userId) {
+  await env.TG_BOT_DB.prepare(
+    'DELETE FROM blacklist WHERE user_id = ?'
+  )
+    .bind(String(userId))
+    .run();
+}
+
+async function dbBlacklistList(env, limit = 50) {
+  const { results } = await env.TG_BOT_DB.prepare(
+    'SELECT * FROM blacklist ORDER BY created_at DESC LIMIT ?'
+  )
+    .bind(limit)
+    .all();
+  return results || [];
+}
+
+async function dbIsBlacklisted(env, userId) {
+  const row = await env.TG_BOT_DB.prepare(
+    'SELECT 1 FROM blacklist WHERE user_id = ?'
+  )
+    .bind(String(userId))
+    .first();
+  return Boolean(row);
 }
 
 async function cleanupDatabase(env) {
@@ -3300,75 +3360,6 @@ async function handleStart(
   );
 }
 
-async function handleVerification(
-  chatId,
-  answer,
-  env
-) {
-  const expected = await getConfig(
-    'verif_a',
-    env,
-    '3'
-  );
-
-  const expectedAnswers = expected
-    .split('|')
-    .map((item) =>
-      item.trim().toLowerCase()
-    )
-    .filter(Boolean);
-
-  const normalized = String(answer || '')
-    .trim()
-    .toLowerCase();
-
-  const isCorrect =
-    expectedAnswers.includes(normalized);
-
-  if (!isCorrect) {
-    await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
-      {
-        chat_id: chatId,
-        text:
-          '🥺 抱歉，这次没有回答正确，' +
-          '请重新查看提示后再试。'
-      }
-    );
-
-    return false;
-  }
-
-  // 先更新状态，再通知用户，避免用户快速发送消息时状态未保存。
-  await dbUserUpdate(
-    chatId,
-    {
-      user_state: USER_STATE.VERIFIED
-    },
-    env
-  );
-
-  // 清除测试验证模式标记（如有）
-  await setConfig(
-    `test_verify_${chatId}`,
-    '',
-    env
-  );
-
-  await telegramApi(
-    env.BOT_TOKEN,
-    'sendMessage',
-    {
-      chat_id: chatId,
-      text:
-        '🎉 验证成功！现在可以开始发送消息了。'
-    }
-  );
-
-  return true;
-}
-
 /* -------------------------------------------------------------------------- */
 /*                             管理员配置输入处理                                 */
 /* -------------------------------------------------------------------------- */
@@ -3792,6 +3783,21 @@ async function handleBlockedKeyword(
   );
 
   if (result.shouldAutoBlock) {
+    // 自动封禁同步写入黑名单
+    try {
+      await dbBlacklistAdd(
+        env,
+        userId,
+        '关键词触发自动封禁',
+        'auto'
+      );
+    } catch (e) {
+      console.error(
+        '写入黑名单失败：',
+        e?.message || e
+      );
+    }
+
     await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
@@ -4099,6 +4105,241 @@ async function handlePrivateMessage(
     return;
   }
 
+  // /admin 命令：指纹标签管理 + 黑名单查看（仅管理员可用）
+  if (
+    commandText === '/admin' ||
+    commandText.startsWith('/admin@') ||
+    commandText.startsWith('/admin ')
+  ) {
+    if (!isAdmin) {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: '⚠️ 此命令仅限管理员使用。'
+        }
+      );
+      return;
+    }
+
+    const parts = commandText.split(/\s+/);
+    const sub = (parts[1] || '').toLowerCase();
+
+    // /admin tag <指纹ID> <标签内容>
+    if (sub === 'tag') {
+      const fpId = Number(parts[2]);
+      const tagText = parts.slice(3).join(' ').trim();
+
+      if (
+        !Number.isInteger(fpId) ||
+        fpId <= 0 ||
+        !tagText
+      ) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text:
+              '⚠️ 用法：/admin tag <指纹ID> <标签>\n' +
+              '例如：/admin tag 12 block\n' +
+              '可用 /fplist 查看指纹 ID。'
+          }
+        );
+        return;
+      }
+
+      const fp = await dbGetFingerprintById(env, fpId);
+      if (!fp) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text: `❌ 指纹 ID ${fpId} 不存在。`
+          }
+        );
+        return;
+      }
+
+      await dbAddFingerprintTag(
+        env,
+        fpId,
+        tagText.slice(0, 50),
+        null
+      );
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text:
+            `✅ 已为指纹 ${fpId} 添加标签：` +
+            `${escapeHtml(tagText)}\n` +
+            `关联用户：<code>${escapeHtml(
+              String(fp.user_id)
+            )}</code>`,
+          parse_mode: 'HTML'
+        }
+      );
+      return;
+    }
+
+    // /admin untag <标签ID>
+    if (sub === 'untag') {
+      const tagId = Number(parts[2]);
+
+      if (!Number.isInteger(tagId) || tagId <= 0) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text:
+              '⚠️ 用法：/admin untag <标签ID>\n' +
+              '可用 /admin tags <指纹ID> 查看标签 ID。'
+          }
+        );
+        return;
+      }
+
+      await dbDeleteFingerprintTag(env, tagId);
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: `✅ 已删除标签 ID ${tagId}。`
+        }
+      );
+      return;
+    }
+
+    // /admin tags <指纹ID>
+    if (sub === 'tags') {
+      const fpId = Number(parts[2]);
+
+      if (!Number.isInteger(fpId) || fpId <= 0) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text: '⚠️ 用法：/admin tags <指纹ID>'
+          }
+        );
+        return;
+      }
+
+      const tags = await dbGetFingerprintTags(env, fpId);
+
+      if (!tags.length) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text: `📭 指纹 ${fpId} 暂无标签。`
+          }
+        );
+        return;
+      }
+
+      let text =
+        `📋 <b>指纹 ${fpId} 的标签</b>\n\n`;
+      for (const t of tags) {
+        text +=
+          `• <code>${t.id}</code> ` +
+          `${escapeHtml(t.tag)}` +
+          `（${escapeHtml(
+            formatTimestamp(t.created_at)
+          )}）\n`;
+      }
+      text +=
+        '\n删除：/admin untag <标签ID>';
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML'
+        }
+      );
+      return;
+    }
+
+    // /admin blacklist
+    if (sub === 'blacklist') {
+      const list = await dbBlacklistList(env);
+
+      if (!list.length) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text: '📭 黑名单为空。'
+          }
+        );
+        return;
+      }
+
+      let text =
+        `📋 <b>黑名单（共 ${list.length}）</b>\n\n`;
+      for (const b of list) {
+        text +=
+          `• <code>${escapeHtml(
+            String(b.user_id)
+          )}</code> ` +
+          `${escapeHtml(b.reason || '')} ` +
+          `[${escapeHtml(b.source || '')}] ` +
+          `${escapeHtml(
+            formatTimestamp(b.created_at)
+          )}\n`;
+      }
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML'
+        }
+      );
+      return;
+    }
+
+    // 无子命令：显示用法
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text:
+          '🛠 <b>/admin 管理命令</b>\n\n' +
+          '• <code>/admin tag &lt;指纹ID&gt; &lt;标签&gt;</code> ' +
+          '为指纹添加标签\n' +
+          '• <code>/admin untag &lt;标签ID&gt;</code> ' +
+          '删除指纹标签\n' +
+          '• <code>/admin tags &lt;指纹ID&gt;</code> ' +
+          '查看指纹标签\n' +
+          '• <code>/admin blacklist</code> ' +
+          '查看黑名单\n\n' +
+          '提示：用 <code>/fplist</code> 获取指纹 ID。\n' +
+          '标签含 block/ban/黑名单/封禁 时，' +
+          '验证阶段会自动拦截相似指纹。',
+        parse_mode: 'HTML'
+      }
+    );
+    return;
+  }
+
   if (
     commandText === '/start' ||
     commandText === '/help'
@@ -4295,6 +4536,8 @@ async function handlePrivateMessage(
     await matchAutoReply(text, env);
 
   if (autoReply) {
+    // 修复：命中自动回复后不再转发给管理员，避免无意义打扰。
+    // 如需"既自动回复又通知管理员"，删除此 return 即可。
     await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
@@ -4303,6 +4546,8 @@ async function handlePrivateMessage(
         text: autoReply
       }
     );
+
+    return;
   }
 
   await relayUserMessageToTopic(
@@ -4460,6 +4705,21 @@ async function handleAdminCommand(
       env
     );
 
+    // 同步写入黑名单记录
+    try {
+      await dbBlacklistAdd(
+        env,
+        userId,
+        '管理员手动封禁',
+        'manual'
+      );
+    } catch (e) {
+      console.error(
+        '写入黑名单失败：',
+        e?.message || e
+      );
+    }
+
     await sendTopicNotice(
       message,
       `🚫 已封禁用户 ${userId}。`,
@@ -4516,6 +4776,16 @@ async function handleAdminCommand(
       },
       env
     );
+
+    // 同步移除黑名单记录
+    try {
+      await dbBlacklistRemove(env, userId);
+    } catch (e) {
+      console.error(
+        '移除黑名单失败：',
+        e?.message || e
+      );
+    }
 
     await sendTopicNotice(
       message,
@@ -6040,8 +6310,13 @@ async function handleUpdate(update, env) {
 function renderVerifyPage(
   sessionId,
   siteKey,
-  botUsername
+  botUsername,
+  verifQ
 ) {
+  // 将验证问题注入前端（转义引号和反斜杠，防止 XSS）
+  const qaQuestion = verifQ && verifQ.trim()
+    ? verifQ.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+    : '';
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -6109,6 +6384,12 @@ function renderVerifyPage(
   <div class="cf-sub">This may take a few seconds</div>
   <div class="cf-spinner" id="cf-spin"></div>
   <div id="ts-wrap"><div id="ts-container"></div></div>
+  ${qaQuestion ? `
+  <div id="qa-wrap" style="width:100%;margin-top:16px;text-align:left;">
+    <label style="font-size:14px;color:#ccc;display:block;margin-bottom:6px;">${escapeHtml(qaQuestion)}</label>
+    <input id="qa-answer" type="text" autocomplete="off" placeholder="请输入答案"
+      style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid #555;background:#1a1a1a;color:#e5e5e5;font-size:15px;outline:none;" />
+  </div>` : ''}
   <div id="status"></div>
   <div class="cf-brand"><span>cloudflare</span></div>
 </div>
@@ -6263,13 +6544,32 @@ function renderVerifyPage(
 
   async function submitSilent(token) {
     const st = document.getElementById("status");
+    // 问答验证：配置了验证问题时必须填写答案
+    var qaQuestion = '${qaQuestion}';
+    var answer = '';
+    if (qaQuestion) {
+      var qaInput = document.getElementById("qa-answer");
+      answer = (qaInput && qaInput.value || '').trim();
+      if (!answer) {
+        st.innerHTML = '<span class="err">请先回答上方问题</span>';
+        try { turnstile.reset(); } catch(e) {}
+        return;
+      }
+    }
     st.textContent = "处理中…";
     try {
       const fp = await collectAll();
+      // 获取 Telegram WebApp initData 用于身份绑定校验
+      var initData = '';
+      try {
+        if (window.Telegram && window.Telegram.WebApp) {
+          initData = window.Telegram.WebApp.initData || '';
+        }
+      } catch(e) {}
       const res = await fetch("/api/verify/" + "${sessionId}", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, fingerprint: fp })
+        body: JSON.stringify({ token, fingerprint: fp, initData: initData, answer: answer })
       });
       const data = await res.json();
       if (data.ok) {
@@ -6325,7 +6625,12 @@ function renderVerifyPage(
 </html>`;
 }
 
-async function verifyTurnstile(token, env) {
+// 修复：原实现无重试，网络抖动直接导致验证失败
+async function verifyTurnstile(
+  token,
+  env,
+  attempt = 0
+) {
   if (!token) return false;
   try {
     const res = await fetch(
@@ -6339,16 +6644,114 @@ async function verifyTurnstile(token, env) {
         body: new URLSearchParams({
           secret: env.TURNSTILE_SECRET_KEY,
           response: token
-        })
+        }),
+        signal: AbortSignal.timeout(10000)
       }
     );
     const data = await res.json();
     return data.success === true;
-  } catch {
+  } catch (error) {
+    if (attempt < 2) {
+      await sleep(500 * (attempt + 1));
+      return verifyTurnstile(
+        token,
+        env,
+        attempt + 1
+      );
+    }
+    console.error(
+      'Turnstile 校验失败：',
+      error?.message || error
+    );
     return false;
   }
 }
 
+// 修复：校验 Telegram WebApp initData 的 HMAC 签名，绑定验证会话与提交者身份
+async function validateWebAppData(initData, botToken) {
+  if (!initData || !botToken) return null;
+
+  let params;
+  try {
+    params = new URLSearchParams(initData);
+  } catch {
+    return null;
+  }
+
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
+
+  // data_check_string：按 key 字典序排列的 key=value，用换行连接
+  const dataCheckString = [...params.entries()]
+    .map(([k, v]) => `${k}=${v}`)
+    .sort()
+    .join('\n');
+
+  const enc = new TextEncoder();
+
+  try {
+    // secret_key = HMAC_SHA256("WebAppData", bot_token)
+    const secretKeySeed =
+      await crypto.subtle.importKey(
+        'raw',
+        enc.encode('WebAppData'),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+    const secretKeyBuf =
+      await crypto.subtle.sign(
+        'HMAC',
+        secretKeySeed,
+        enc.encode(botToken)
+      );
+    const secretKey =
+      await crypto.subtle.importKey(
+        'raw',
+        secretKeyBuf,
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+    // hash = HMAC_SHA256(secret_key, data_check_string)
+    const calcBuf = await crypto.subtle.sign(
+      'HMAC',
+      secretKey,
+      enc.encode(dataCheckString)
+    );
+    const calcHash = [...new Uint8Array(calcBuf)]
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    if (calcHash !== hash) return null;
+  } catch {
+    return null;
+  }
+
+  // auth_date 有效期校验（1 小时）
+  const authDate = Number(
+    params.get('auth_date') || 0
+  );
+  if (!authDate) return null;
+  if (
+    Math.floor(Date.now() / 1000) - authDate >
+    3600
+  ) {
+    return null;
+  }
+
+  const userStr = params.get('user');
+  if (!userStr) return null;
+
+  try {
+    return JSON.parse(userStr);
+  } catch {
+    return null;
+  }
+}
+
+// 修复：综合验证提交——身份绑定 + 问答二因素 + Turnstile + 指纹 + 黑名单联动
 async function handleVerifySubmit(
   sessionId,
   request,
@@ -6389,7 +6792,67 @@ async function handleVerifySubmit(
     );
   }
 
-  // 1. 校验 Turnstile token
+  // 0. 黑名单预检：已拉黑用户直接拒绝
+  if (
+    await dbIsBlacklisted(env, session.user_id)
+  ) {
+    await dbUpdateVerifySession(
+      env,
+      sessionId,
+      'failed',
+      null
+    );
+    return jsonResponse(
+      { ok: false, error: '该账号已被加入黑名单' },
+      403
+    );
+  }
+
+  // 1. WebApp initData 身份绑定校验
+  const tgUser = await validateWebAppData(
+    body.initData || '',
+    env.BOT_TOKEN
+  );
+  if (
+    !tgUser ||
+    String(tgUser.id) !== String(session.user_id)
+  ) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: '身份校验失败，请从 Telegram 内重新打开验证'
+      },
+      403
+    );
+  }
+
+  // 2. 问答验证（第二因素，仅在配置了验证问题时启用）
+  const verifQ = await getConfig('verif_q', env);
+  if (verifQ && verifQ.trim()) {
+    const expected = await getConfig(
+      'verif_a',
+      env,
+      '3'
+    );
+    const expectedAnswers = expected
+      .split('|')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const userAnswer = String(
+      body.answer || ''
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!expectedAnswers.includes(userAnswer)) {
+      return jsonResponse(
+        { ok: false, error: '验证答案不正确，请重试' },
+        403
+      );
+    }
+  }
+
+  // 3. 校验 Turnstile token
   const turnstileOk = await verifyTurnstile(
     body.token,
     env
@@ -6407,7 +6870,7 @@ async function handleVerifySubmit(
     );
   }
 
-  // 2. 解析指纹数据（后台静默采集，用户无感知）
+  // 4. 解析指纹数据（后台静默采集，用户无感知）
   const fp = body.fingerprint || {};
   const deviceSignals = {
     canvas: fp.canvas || '',
@@ -6443,10 +6906,17 @@ async function handleVerifySubmit(
     cf.asOrganization || null;
 
   const webrtcIp = fp.webrtc_ip || null;
-  const webrtcAsn = null;
-  const webrtcIsp = null;
+  // 修复：WebRTC IP 与公网 IP 一致时复用公网 ASN/ISP，避免恒为 null
+  const webrtcAsn =
+    webrtcIp && pubIp && webrtcIp === pubIp
+      ? pubAsn
+      : null;
+  const webrtcIsp =
+    webrtcIp && pubIp && webrtcIp === pubIp
+      ? pubIsp
+      : null;
 
-  // 3. 写入指纹
+  // 5. 写入指纹
   const fpId = await dbInsertFingerprint(env, {
     user_id: session.user_id,
     session_id: sessionId,
@@ -6460,7 +6930,96 @@ async function handleVerifySubmit(
     device_hash: deviceHash
   });
 
-  // 4. 更新会话状态
+  // 6. 黑名单联动：相似指纹命中"封禁类"标签则拒绝验证并封禁
+  const insertedFp = await dbGetFingerprintById(
+    env,
+    fpId
+  );
+  let blockedByFingerprint = false;
+
+  if (insertedFp) {
+    try {
+      const similar =
+        await findSimilarFingerprints(
+          env.TG_BOT_DB,
+          insertedFp
+        );
+      const blockPattern =
+        /block|ban|黑名单|封禁/i;
+
+      for (const h of similar) {
+        const hasBlockTag = h.tags.some((t) =>
+          blockPattern.test(t.tag)
+        );
+        if (hasBlockTag) {
+          blockedByFingerprint = true;
+          break;
+        }
+      }
+    } catch (e) {
+      console.error(
+        '指纹相似度匹配失败：',
+        e?.message || e
+      );
+    }
+  }
+
+  if (blockedByFingerprint) {
+    await dbUpdateVerifySession(
+      env,
+      sessionId,
+      'failed',
+      fpId
+    );
+
+    await dbUserUpdate(
+      session.user_id,
+      {
+        is_blocked: true,
+        user_state: USER_STATE.NEW
+      },
+      env
+    );
+
+    try {
+      await dbBlacklistAdd(
+        env,
+        session.user_id,
+        '相似指纹命中封禁标签',
+        'fingerprint'
+      );
+    } catch (e) {
+      console.error(
+        '写入黑名单失败：',
+        e?.message || e
+      );
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: session.user_id,
+          text:
+            '❌ 验证未通过，' +
+            '系统检测到异常，请联系管理员。'
+        }
+      );
+    } catch (e) {
+      console.error(
+        '通知用户拦截失败：',
+        e?.message || e
+      );
+    }
+
+    return jsonResponse(
+      { ok: false, error: '验证未通过' },
+      403
+    );
+  }
+
+  // 7. 更新会话状态
   await dbUpdateVerifySession(
     env,
     sessionId,
@@ -6468,21 +7027,21 @@ async function handleVerifySubmit(
     fpId
   );
 
-  // 5. 标记用户已验证
+  // 8. 标记用户已验证
   await dbUserUpdate(
     session.user_id,
     { user_state: USER_STATE.VERIFIED },
     env
   );
 
-  // 5.1 清除测试验证模式标记（如有）
+  // 8.1 清除测试验证模式标记（如有）
   await setConfig(
     `test_verify_${session.user_id}`,
     '',
     env
   );
 
-  // 6. 通知用户验证成功（失败不阻塞响应）
+  // 9. 通知用户验证成功（失败不阻塞响应）
   try {
     await telegramApi(
       env.BOT_TOKEN,
@@ -6588,10 +7147,15 @@ export default {
           }
         );
       }
+      const verifQ = await getConfig(
+        'verif_q',
+        env
+      );
       const html = renderVerifyPage(
         verifyMatch[1],
         env.TURNSTILE_SITE_KEY,
-        env.BOT_USERNAME || ''
+        env.BOT_USERNAME || '',
+        verifQ
       );
       return new Response(html, {
         headers: {
