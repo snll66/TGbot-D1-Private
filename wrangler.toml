@@ -1,0 +1,17 @@
+name = "tgbot-d1"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# 非机密变量（管理员ID、管理群ID、应用基础URL、Bot用户名）
+# 请替换为你自己的值
+[vars]
+ADMIN_IDS = "你的Telegram用户ID"
+ADMIN_GROUP_ID = "-100你的超级群组ID"
+APP_BASE_URL = "https://你的Worker域名"
+BOT_USERNAME = "你的Bot用户名"
+
+# D1 数据库绑定，变量名必须严格为 TG_BOT_DB（代码读取 env.TG_BOT_DB）
+[[d1_databases]]
+binding = "TG_BOT_DB"
+database_name = "tg-bot-db"
+database_id = "你的D1数据库ID"
