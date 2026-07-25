@@ -3073,19 +3073,11 @@ async function showBaseMenu(
     env
   );
 
-  const verificationQuestion =
-    await getConfig('verif_q', env);
-
-  const verificationAnswer =
-    await getConfig('verif_a', env);
-
   const text = `
 ⚙️ <b>基础配置</b>
 
 <b>当前设置：</b>
 • 欢迎消息：${escapeHtml(welcomeMsg).slice(0, 30)}${welcomeMsg.length > 30 ? '…' : ''}
-• 验证问题：${escapeHtml(verificationQuestion).slice(0, 30)}${verificationQuestion.length > 30 ? '…' : ''}
-• 验证答案：<code>${escapeHtml(verificationAnswer)}</code>
 
 请选择要修改的配置项：
   `.trim();
@@ -3097,20 +3089,6 @@ async function showBaseMenu(
           text: '📝 编辑欢迎消息',
           callback_data:
             'config:edit:welcome_msg'
-        }
-      ],
-      [
-        {
-          text: '❓ 编辑验证问题',
-          callback_data:
-            'config:edit:verif_q'
-        }
-      ],
-      [
-        {
-          text: '🔑 编辑验证答案',
-          callback_data:
-            'config:edit:verif_a'
         }
       ],
       [
@@ -3871,9 +3849,7 @@ async function handleAdminConfigInput(
 
   if (
     [
-      'welcome_msg',
-      'verif_q',
-      'verif_a'
+      'welcome_msg'
     ].includes(state.key)
   ) {
     await showBaseMenu(userId, env);
@@ -4680,6 +4656,14 @@ async function handlePrivateMessage(
     );
 
   if (user.is_blocked) {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text: '❌ 您已被拉黑，验证不通过。'
+      }
+    );
     return;
   }
 
@@ -6250,8 +6234,6 @@ async function handleConfigCallback(
   if (action === 'edit') {
     const editableKeys = new Set([
       'welcome_msg',
-      'verif_q',
-      'verif_a',
       'block_threshold',
       'authorized_admins'
     ]);
@@ -6274,11 +6256,6 @@ async function handleConfigCallback(
 
     if (key === 'welcome_msg') {
       prompt = '请发送新的欢迎消息：';
-    } else if (key === 'verif_q') {
-      prompt = '请发送新的验证问题：';
-    } else if (key === 'verif_a') {
-      prompt =
-        '请发送新的验证答案；多个答案使用 | 分隔：';
     } else if (
       key === 'block_threshold'
     ) {
@@ -7260,8 +7237,23 @@ async function handleVerifySubmit(
       'failed',
       null
     );
+
+    // 通过 Telegram 通知用户已被拉黑
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: session.user_id,
+          text: '❌ 您已被拉黑，验证不通过。'
+        }
+      );
+    } catch (e) {
+      console.error('通知拉黑用户失败：', e?.message || e);
+    }
+
     return jsonResponse(
-      { ok: false, error: '该账号已被加入黑名单' },
+      { ok: false, error: '您已被拉黑，验证不通过' },
       403
     );
   }
