@@ -569,6 +569,10 @@ async function dbMigrate(env) {
     ON fingerprints(user_id)
     `,
     `
+    CREATE INDEX IF NOT EXISTS idx_fingerprints_user_hash
+    ON fingerprints(user_id, device_hash)
+    `,
+    `
     CREATE INDEX IF NOT EXISTS idx_fingerprint_tags_fp
     ON fingerprint_tags(fingerprint_id)
     `
@@ -916,6 +920,37 @@ async function dbInsertFingerprint(
   const now = Math.floor(
     Date.now() / 1000
   );
+
+  // 去重：同用户 + 同设备指纹已存在则复用，避免重复记录堆积
+  const existing = await env.TG_BOT_DB.prepare(
+    'SELECT id FROM fingerprints WHERE user_id = ? AND device_hash = ? ORDER BY created_at DESC LIMIT 1'
+  )
+    .bind(data.user_id, data.device_hash)
+    .first();
+
+  if (existing) {
+    // IP/ASN 可能变化，更新最新网络信息
+    await env.TG_BOT_DB.prepare(
+      `UPDATE fingerprints
+       SET pub_ip = ?, pub_asn = ?, pub_isp = ?,
+           webrtc_ip = ?, webrtc_asn = ?, webrtc_isp = ?,
+           created_at = ?
+       WHERE id = ?`
+    )
+      .bind(
+        data.pub_ip ?? null,
+        data.pub_asn ?? null,
+        data.pub_isp ?? null,
+        data.webrtc_ip ?? null,
+        data.webrtc_asn ?? null,
+        data.webrtc_isp ?? null,
+        now,
+        existing.id
+      )
+      .run();
+    return existing.id;
+  }
+
   const res = await env.TG_BOT_DB.prepare(
     `INSERT INTO fingerprints
        (user_id, session_id, pub_ip, pub_asn, pub_isp,
@@ -6369,7 +6404,7 @@ function renderVerifyPage(
   .ok-hint { font-size: 14px; color: #888; }
   .hidden { display: none !important; }
 </style>
-<script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+<script src="https://telegram.org/js/telegram-web-app.js" async></script>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTsLoad" async defer></script>
 </head>
 <body>
@@ -6399,19 +6434,29 @@ function renderVerifyPage(
   <div class="ok-hint">请返回 Telegram 继续操作</div>
 </div>
 <script>
-  // 设置 WebApp 背景色（等 telegram-web-app.js defer 加载后执行）
+  // 设置 WebApp 背景色（不等 defer 脚本，直接轮询检测）
   (function setBg() {
     if (window.Telegram && window.Telegram.WebApp) {
       try {
         window.Telegram.WebApp.setBackgroundColor('#1a1a1a');
         window.Telegram.WebApp.setHeaderColor('#1a1a1a');
+        window.Telegram.WebApp.expand();
       } catch(e) {}
     } else {
-      setTimeout(setBg, 50);
+      setTimeout(setBg, 30);
     }
   })();
 
   const FP = { canvas: "", webgl: "", audio: "", os: "", cpu: "", screen: "", fonts: "" };
+
+  // 预采集指纹：页面加载即开始，与 Turnstile 验证并行，减少总等待时间
+  var _fpPromise = null;
+  function preCollectFingerprint() {
+    if (!_fpPromise) {
+      _fpPromise = collectAll();
+    }
+    return _fpPromise;
+  }
 
   async function collectCanvas() {
     try {
@@ -6558,7 +6603,8 @@ function renderVerifyPage(
     }
     st.textContent = "处理中…";
     try {
-      const fp = await collectAll();
+      // 复用预采集的指纹结果（与 Turnstile 验证并行已完成）
+      const fp = await preCollectFingerprint();
       // 获取 Telegram WebApp initData 用于身份绑定校验
       var initData = '';
       try {
@@ -6590,6 +6636,9 @@ function renderVerifyPage(
       st.innerHTML = '<span class="err">网络错误，请重试</span>';
     }
   }
+
+  // 页面加载即启动指纹预采集，与 Turnstile 验证并行执行
+  preCollectFingerprint();
 
   window.onTsLoad = function() {
     var container = document.getElementById("ts-container");
