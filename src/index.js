@@ -9,6 +9,7 @@ const DEFAULTS = {
     '在发消息之前，请先完成人机验证，验证完成后即可正常发送消息。',
   verif_q: '',
   verif_a: '3',
+  turnstile_enabled: 'true',
   keyword_responses: '[]',
   block_keywords: '[]',
   block_threshold: '5',
@@ -2032,9 +2033,9 @@ async function buildFingerprintHtml(
     `<b>系统:</b> ${escapeHtml(dev.os || 'N/A')}`,
     `<b>CPU:</b> ${escapeHtml(dev.cpu || 'N/A')}`,
     `<b>屏幕:</b> ${escapeHtml(dev.screen || 'N/A')}`,
-    `<b>公网 IP:</b> <code>${escapeHtml(fp.pub_ip || 'N/A')}</code>`,
+    `<b>公网 IP:</b> ${fp.pub_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(fp.pub_ip)}"><code>${escapeHtml(fp.pub_ip)}</code></a>` : '<code>N/A</code>'}`,
     `<b>ASN/ISP:</b> ${escapeHtml(fp.pub_asn || 'N/A')} / ${escapeHtml(fp.pub_isp || 'N/A')}`,
-    `<b>WebRTC IP:</b> <code>${escapeHtml(fp.webrtc_ip || 'N/A')}</code>`,
+    `<b>WebRTC IP:</b> ${fp.webrtc_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(fp.webrtc_ip)}"><code>${escapeHtml(fp.webrtc_ip)}</code></a>` : '<code>N/A</code>'}`,
     `<b>指纹 ID:</b> <code>${fp.id}</code>`
   ];
 
@@ -3072,12 +3073,23 @@ async function showBaseMenu(
     'welcome_msg',
     env
   );
+  const verifQ = await getConfig(
+    'verif_q',
+    env
+  );
+  const turnstileEnabled = (
+    await getConfig('turnstile_enabled', env)
+  ).toLowerCase() === 'true';
 
   const text = `
 ⚙️ <b>基础配置</b>
 
 <b>当前设置：</b>
 • 欢迎消息：${escapeHtml(welcomeMsg).slice(0, 30)}${welcomeMsg.length > 30 ? '…' : ''}
+• CF 人机验证：${turnstileEnabled ? '✅ 已开启' : '❌ 已关闭'}
+• 验证问答：${verifQ && verifQ.trim() ? '✅ 已配置' : '❌ 未配置'}
+
+${turnstileEnabled ? '⚠️ CF 人机验证已开启，验证问答作为第二因素叠加使用。关闭 CF 验证后将仅使用验证问答。' : 'ℹ️ CF 验证已关闭，用户仅需回答验证问题即可通过。请确保已配置验证问答。'}
 
 请选择要修改的配置项：
   `.trim();
@@ -3089,6 +3101,29 @@ async function showBaseMenu(
           text: '📝 编辑欢迎消息',
           callback_data:
             'config:edit:welcome_msg'
+        }
+      ],
+      [
+        {
+          text: turnstileEnabled
+            ? '🔒 关闭 CF 人机验证'
+            : '🔓 开启 CF 人机验证',
+          callback_data:
+            'config:toggle:turnstile_enabled'
+        }
+      ],
+      [
+        {
+          text: '❓ 编辑验证问题',
+          callback_data:
+            'config:edit:verif_q'
+        }
+      ],
+      [
+        {
+          text: '✅ 编辑验证答案',
+          callback_data:
+            'config:edit:verif_a'
         }
       ],
       [
@@ -3534,6 +3569,25 @@ async function handleAdminConfigInput(
 
   let finalValue = String(text || '');
 
+  // verif_q 允许通过发送"清除"来清空验证问题
+  if (
+    state.key === 'verif_q' &&
+    finalValue.trim() === '清除'
+  ) {
+    await setConfig('verif_q', '', env);
+    await clearAdminState(userId, env);
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: userId,
+        text: '✅ 验证问题已清除。'
+      }
+    );
+    await showBaseMenu(userId, env);
+    return;
+  }
+
   if (!finalValue.trim()) {
     await sendAdminInputError(
       userId,
@@ -3849,7 +3903,9 @@ async function handleAdminConfigInput(
 
   if (
     [
-      'welcome_msg'
+      'welcome_msg',
+      'verif_q',
+      'verif_a'
     ].includes(state.key)
   ) {
     await showBaseMenu(userId, env);
@@ -4121,12 +4177,8 @@ async function handlePrivateMessage(
         `<b>昵称:</b> ${escapeHtml(h.userInfo?.name || '未知')}\n` +
         `<b>用户名:</b> ${escapeHtml(h.userInfo?.username || '无')}\n` +
         `<b>系统:</b> ${escapeHtml(dev.os || 'N/A')}\n` +
-        `<b>公网 IP:</b> <code>${escapeHtml(
-          h.fingerprint.pub_ip || 'N/A'
-        )}</code>\n` +
-        `<b>WebRTC IP:</b> <code>${escapeHtml(
-          h.fingerprint.webrtc_ip || 'N/A'
-        )}</code>\n` +
+        `<b>公网 IP:</b> ${h.fingerprint.pub_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(h.fingerprint.pub_ip)}"><code>${escapeHtml(h.fingerprint.pub_ip)}</code></a>` : '<code>N/A</code>'}\n` +
+        `<b>WebRTC IP:</b> ${h.fingerprint.webrtc_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(h.fingerprint.webrtc_ip)}"><code>${escapeHtml(h.fingerprint.webrtc_ip)}</code></a>` : '<code>N/A</code>'}\n` +
         `<b>采集时间:</b> <code>${escapeHtml(
           formatTimestamp(
             h.fingerprint.created_at
@@ -6208,10 +6260,32 @@ async function handleConfigCallback(
       'enable_sticker_forwarding',
       'enable_user_forwarding',
       'enable_group_forwarding',
-      'enable_channel_forwarding'
+      'enable_channel_forwarding',
+      'turnstile_enabled'
     ]);
 
     if (!allowedToggleKeys.has(key)) {
+      return;
+    }
+
+    // turnstile_enabled 是独立切换，不在 filter 菜单中
+    if (key === 'turnstile_enabled') {
+      const current = (
+        await getConfig(
+          'turnstile_enabled',
+          env
+        )
+      ).toLowerCase() === 'true';
+      await setConfig(
+        'turnstile_enabled',
+        current ? 'false' : 'true',
+        env
+      );
+      await showBaseMenu(
+        chatId,
+        env,
+        message.message_id
+      );
       return;
     }
 
@@ -6236,7 +6310,9 @@ async function handleConfigCallback(
     const editableKeys = new Set([
       'welcome_msg',
       'block_threshold',
-      'authorized_admins'
+      'authorized_admins',
+      'verif_q',
+      'verif_a'
     ]);
 
     if (!editableKeys.has(key)) {
@@ -6267,6 +6343,13 @@ async function handleConfigCallback(
     ) {
       prompt =
         '请发送协管员 ID 列表，多个 ID 使用英文逗号分隔：';
+    } else if (key === 'verif_q') {
+      prompt =
+        '请发送验证问题（用户验证时需要回答的问题）：\n' +
+        '留空发送可清除验证问题。';
+    } else if (key === 'verif_a') {
+      prompt =
+        '请发送验证答案（多个可选答案用 | 分隔）：';
     }
 
     await renderMenu(env, {
@@ -6733,7 +6816,8 @@ function renderVerifyPage(
   sessionId,
   siteKey,
   botUsername,
-  verifQ
+  verifQ,
+  turnstileEnabled = true
 ) {
   // 将验证问题注入前端（转义引号和反斜杠，防止 XSS）
   const qaQuestion = verifQ && verifQ.trim()
@@ -6792,7 +6876,7 @@ function renderVerifyPage(
   .hidden { display: none !important; }
 </style>
 <script src="https://telegram.org/js/telegram-web-app.js" async></script>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTsLoad" async defer></script>
+${turnstileEnabled ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTsLoad" async defer></script>' : ''}
 </head>
 <body>
 <div id="page-loading" class="cf-box">
@@ -6802,18 +6886,19 @@ function renderVerifyPage(
     <path d="M37.8 26.2c-.5-1.2-1.5-2.1-2.7-2.5.2-.6.3-1.2.3-1.9 0-2.8-2.3-5.2-5.2-5.2-.2 0-.4 0-.6.1-.6-2.6-2.9-4.5-5.6-4.5-1.7 0-3.3.7-4.4 1.9-.9-.5-1.9-.8-3-.8-3.2 0-5.9 2.5-6.2 5.6-2.4.7-4.2 2.9-4.2 5.6 0 .4 0 .7.1 1.1.1.3.3.5.6.5h28.4c.3 0 .5-.2.6-.4.1-.3.1-.5.1-.8 0-.2 0-.4-.1-.6z" fill="#f48120"/>
     <path d="M37.8 26.2c-.5-1.2-1.5-2.1-2.7-2.5.2-.6.3-1.2.3-1.9 0-2.8-2.3-5.2-5.2-5.2-.2 0-.4 0-.6.1-.6-2.6-2.9-4.5-5.6-4.5-1.7 0-3.3.7-4.4 1.9-.9-.5-1.9-.8-3-.8-3.2 0-5.9 2.5-6.2 5.6-2.4.7-4.2 2.9-4.2 5.6 0 .4 0 .7.1 1.1.1.3.3.5.6.5h28.4c.3 0 .5-.2.6-.4.1-.3.1-.5.1-.8 0-.2 0-.4-.1-.6z" fill="#faad3f" opacity="0.3"/>
   </svg>
-  <div class="cf-title">Verifying you are human</div>
-  <div class="cf-sub">This may take a few seconds</div>
-  <div class="cf-spinner" id="cf-spin"></div>
-  <div id="ts-wrap"><div id="ts-container"></div></div>
+  <div class="cf-title">${turnstileEnabled ? 'Verifying you are human' : '请完成验证'}</div>
+  <div class="cf-sub">${turnstileEnabled ? 'This may take a few seconds' : '请回答下方验证问题'}</div>
+  ${turnstileEnabled ? '<div class="cf-spinner" id="cf-spin"></div>' : ''}
+  ${turnstileEnabled ? '<div id="ts-wrap"><div id="ts-container"></div></div>' : ''}
   ${qaQuestion ? `
   <div id="qa-wrap" style="width:100%;margin-top:16px;text-align:left;">
     <label style="font-size:14px;color:#ccc;display:block;margin-bottom:6px;">${escapeHtml(qaQuestion)}</label>
     <input id="qa-answer" type="text" autocomplete="off" placeholder="请输入答案"
       style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid #555;background:#1a1a1a;color:#e5e5e5;font-size:15px;outline:none;" />
   </div>` : ''}
+  ${!turnstileEnabled ? '<button id="qa-submit" onclick="submitNoTurnstile()" style="margin-top:16px;width:100%;padding:12px;border-radius:8px;border:none;background:#f48120;color:#fff;font-size:16px;font-weight:600;cursor:pointer;">提交验证</button>' : ''}
   <div id="status"></div>
-  <div class="cf-brand"><span>cloudflare</span></div>
+  ${turnstileEnabled ? '<div class="cf-brand"><span>cloudflare</span></div>' : ''}
 </div>
 <div id="page-ok" class="cf-box hidden">
   <div class="ok-icon">✅</div>
@@ -7027,6 +7112,60 @@ function renderVerifyPage(
   // 页面加载即启动指纹预采集，与 Turnstile 验证并行执行
   preCollectFingerprint();
 
+  // 无 Turnstile 模式：用户点击提交按钮直接验证
+  ${!turnstileEnabled ? `
+  async function submitNoTurnstile() {
+    var st = document.getElementById("status");
+    var qaQuestion = '${qaQuestion}';
+    var answer = '';
+    if (qaQuestion) {
+      var qaInput = document.getElementById("qa-answer");
+      answer = (qaInput && qaInput.value || '').trim();
+      if (!answer) {
+        st.innerHTML = '<span class="err">请先回答上方问题</span>';
+        return;
+      }
+    }
+    var btn = document.getElementById("qa-submit");
+    if (btn) btn.disabled = true;
+    st.textContent = "处理中…";
+    try {
+      const fp = await preCollectFingerprint();
+      var initData = '';
+      try {
+        if (window.Telegram && window.Telegram.WebApp) {
+          initData = window.Telegram.WebApp.initData || '';
+        }
+      } catch(e) {}
+      const res = await fetch("/api/verify/" + "${sessionId}", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: "", fingerprint: fp, initData: initData, answer: answer })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        document.getElementById("page-loading").classList.add("hidden");
+        document.getElementById("page-ok").classList.remove("hidden");
+        document.title = "完成";
+        setTimeout(function() {
+          try {
+            if (window.Telegram && window.Telegram.WebApp) {
+              window.Telegram.WebApp.close();
+            }
+          } catch(e) {}
+        }, 1500);
+      } else {
+        st.innerHTML = '<span class="err">' + (data.error || '验证失败，请重试') + '</span>';
+        if (btn) btn.disabled = false;
+      }
+    } catch (e) {
+      st.innerHTML = '<span class="err">网络错误，请重试</span>';
+      if (btn) btn.disabled = false;
+    }
+  }
+  ` : ''}
+
+  ${turnstileEnabled ? `
   window.onTsLoad = function() {
     var container = document.getElementById("ts-container");
     if (!container) {
@@ -7056,6 +7195,7 @@ function renderVerifyPage(
       document.getElementById("status").innerHTML = '<span class="err">加载失败，请刷新重试</span>';
     }
   };
+  ` : ''}
 </script>
 </body>
 </html>`;
@@ -7277,8 +7417,29 @@ async function handleVerifySubmit(
     );
   }
 
-  // 2. 问答验证（第二因素，仅在配置了验证问题时启用）
+  // 2. 问答验证（CF 关闭时作为主验证；CF 开启时作为第二因素）
   const verifQ = await getConfig('verif_q', env);
+  const turnstileEnabledForCheck = (
+    await getConfig(
+      'turnstile_enabled',
+      env
+    )
+  ).toLowerCase() === 'true';
+
+  // 安全检查：CF 验证和问答都未启用时拒绝验证
+  if (
+    !turnstileEnabledForCheck &&
+    !(verifQ && verifQ.trim())
+  ) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: '验证未正确配置，请联系管理员开启人机验证或设置验证问答'
+      },
+      403
+    );
+  }
+
   if (verifQ && verifQ.trim()) {
     const expected = await getConfig(
       'verif_a',
@@ -7303,22 +7464,24 @@ async function handleVerifySubmit(
     }
   }
 
-  // 3. 校验 Turnstile token
-  const turnstileOk = await verifyTurnstile(
-    body.token,
-    env
-  );
-  if (!turnstileOk) {
-    await dbUpdateVerifySession(
-      env,
-      sessionId,
-      'failed',
-      null
+  // 3. 校验 Turnstile token（CF 人机验证关闭时跳过）
+  if (turnstileEnabledForCheck) {
+    const turnstileOk = await verifyTurnstile(
+      body.token,
+      env
     );
-    return jsonResponse(
-      { ok: false, error: '人机验证失败，请重试' },
-      403
-    );
+    if (!turnstileOk) {
+      await dbUpdateVerifySession(
+        env,
+        sessionId,
+        'failed',
+        null
+      );
+      return jsonResponse(
+        { ok: false, error: '人机验证失败，请重试' },
+        403
+      );
+    }
   }
 
   // 4. 解析指纹数据（后台静默采集，用户无感知）
@@ -7665,11 +7828,18 @@ export default {
         'verif_q',
         env
       );
+      const turnstileEnabled = (
+        await getConfig(
+          'turnstile_enabled',
+          env
+        )
+      ).toLowerCase() === 'true';
       const html = renderVerifyPage(
         verifyMatch[1],
         env.TURNSTILE_SITE_KEY,
         env.BOT_USERNAME || '',
-        verifQ
+        verifQ,
+        turnstileEnabled
       );
       return new Response(html, {
         headers: {
