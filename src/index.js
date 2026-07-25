@@ -64,46 +64,62 @@ async function ensureBotCommands(env) {
     return botCommandsPromise;
   }
 
-  botCommandsPromise = telegramApi(
-    env.BOT_TOKEN,
-    'setMyCommands',
-    {
-      commands: [
-        {
-          command: 'ban',
-          description: '封禁当前话题用户'
-        },
-        {
-          command: 'unban',
-          description: '解除当前话题用户封禁'
-        },
-        {
-          command: 'delete',
-          description: '删除被回复的消息'
-        },
-        {
-          command: 'terminate',
-          description: '删除当前用户话题'
-        },
-        {
-          command: 'card',
-          description: '重新创建当前用户资料卡'
-        },
-        {
-          command: 'admin',
-          description: '管理命令（指纹标签/黑名单）'
-        },
-        {
-          command: 'testverify',
-          description: '测试验证流程 /testverify 用户ID'
-        },
-        {
-          command: 'reset',
-          description: '重置用户验证 /reset 用户ID'
+  botCommandsPromise = Promise.all([
+    // 默认 scope：恢复原始管理命令列表
+    telegramApi(
+      env.BOT_TOKEN,
+      'setMyCommands',
+      {
+        commands: [
+          {
+            command: 'ban',
+            description: '封禁当前话题用户'
+          },
+          {
+            command: 'unban',
+            description: '解除当前话题用户封禁'
+          },
+          {
+            command: 'delete',
+            description: '删除被回复的消息'
+          },
+          {
+            command: 'terminate',
+            description: '删除当前用户话题'
+          },
+          {
+            command: 'card',
+            description: '重新创建当前用户资料卡'
+          },
+          {
+            command: 'admin',
+            description: '管理命令（指纹标签/黑名单）'
+          },
+          {
+            command: 'testverify',
+            description: '测试验证流程 /testverify 用户ID'
+          },
+          {
+            command: 'reset',
+            description: '重置用户验证 /reset 用户ID'
+          }
+        ]
+      }
+    ),
+    // 清除管理群 chat scope 残留
+    telegramApi(
+      env.BOT_TOKEN,
+      'deleteMyCommands',
+      {
+        scope: {
+          type: 'chat',
+          chat_id: Number(
+            env.ADMIN_GROUP_ID
+          )
         }
-      ]
-    }
-  ).catch((error) => {
+      }
+    ).catch(() => {})
+  ]).catch((error) => {
     botCommandsPromise = null;
 
     console.error(
@@ -2033,9 +2049,9 @@ async function buildFingerprintHtml(
     `<b>系统:</b> ${escapeHtml(dev.os || 'N/A')}`,
     `<b>CPU:</b> ${escapeHtml(dev.cpu || 'N/A')}`,
     `<b>屏幕:</b> ${escapeHtml(dev.screen || 'N/A')}`,
-    `<b>公网 IP:</b> ${fp.pub_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(fp.pub_ip)}"><code>${escapeHtml(fp.pub_ip)}</code></a>` : '<code>N/A</code>'}`,
+    `<b>公网 IP:</b> ${fp.pub_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(fp.pub_ip)}">${escapeHtml(fp.pub_ip)}</a>` : '<code>N/A</code>'}`,
     `<b>ASN/ISP:</b> ${escapeHtml(fp.pub_asn || 'N/A')} / ${escapeHtml(fp.pub_isp || 'N/A')}`,
-    `<b>WebRTC IP:</b> ${fp.webrtc_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(fp.webrtc_ip)}"><code>${escapeHtml(fp.webrtc_ip)}</code></a>` : '<code>N/A</code>'}`,
+    `<b>WebRTC IP:</b> ${fp.webrtc_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(fp.webrtc_ip)}">${escapeHtml(fp.webrtc_ip)}</a>` : '<code>N/A</code>'}`,
     `<b>指纹 ID:</b> <code>${fp.id}</code>`
   ];
 
@@ -3094,45 +3110,59 @@ ${turnstileEnabled ? '⚠️ CF 人机验证已开启，验证问答作为第二
 请选择要修改的配置项：
   `.trim();
 
-  const reply_markup = {
-    inline_keyboard: [
-      [
-        {
-          text: '📝 编辑欢迎消息',
-          callback_data:
-            'config:edit:welcome_msg'
-        }
-      ],
-      [
-        {
-          text: turnstileEnabled
-            ? '🔒 关闭 CF 人机验证'
-            : '🔓 开启 CF 人机验证',
-          callback_data:
-            'config:toggle:turnstile_enabled'
-        }
-      ],
-      [
-        {
-          text: '❓ 编辑验证问题',
-          callback_data:
-            'config:edit:verif_q'
-        }
-      ],
-      [
-        {
-          text: '✅ 编辑验证答案',
-          callback_data:
-            'config:edit:verif_a'
-        }
-      ],
-      [
-        {
-          text: '⬅️ 返回主菜单',
-          callback_data: 'config:menu'
-        }
-      ]
+  const keyboard = [
+    [
+      {
+        text: '📝 编辑欢迎消息',
+        callback_data:
+          'config:edit:welcome_msg'
+      }
+    ],
+    [
+      {
+        text: turnstileEnabled
+          ? '🔒 关闭 CF 人机验证'
+          : '🔓 开启 CF 人机验证',
+        callback_data:
+          'config:toggle:turnstile_enabled'
+      }
+    ],
+    [
+      {
+        text: '❓ 编辑验证问题',
+        callback_data:
+          'config:edit:verif_q'
+      }
+    ],
+    [
+      {
+        text: '✅ 编辑验证答案',
+        callback_data:
+          'config:edit:verif_a'
+      }
     ]
+  ];
+
+  // 已配置验证问答时显示清除按钮
+  if (verifQ && verifQ.trim()) {
+    keyboard.push([
+      {
+        text: '🗑 清除验证问答',
+        callback_data:
+          'config:clear:verif_q'
+      }
+    ]);
+  }
+
+  keyboard.push([
+    {
+      text: '⬅️ 返回主菜单',
+      callback_data: 'config:menu'
+    }
+  ]);
+
+  const reply_markup = {
+    inline_keyboard: keyboard
   };
 
   await renderMenu(env, {
@@ -4177,8 +4207,8 @@ async function handlePrivateMessage(
         `<b>昵称:</b> ${escapeHtml(h.userInfo?.name || '未知')}\n` +
         `<b>用户名:</b> ${escapeHtml(h.userInfo?.username || '无')}\n` +
         `<b>系统:</b> ${escapeHtml(dev.os || 'N/A')}\n` +
-        `<b>公网 IP:</b> ${h.fingerprint.pub_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(h.fingerprint.pub_ip)}"><code>${escapeHtml(h.fingerprint.pub_ip)}</code></a>` : '<code>N/A</code>'}\n` +
-        `<b>WebRTC IP:</b> ${h.fingerprint.webrtc_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(h.fingerprint.webrtc_ip)}"><code>${escapeHtml(h.fingerprint.webrtc_ip)}</code></a>` : '<code>N/A</code>'}\n` +
+        `<b>公网 IP:</b> ${h.fingerprint.pub_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(h.fingerprint.pub_ip)}">${escapeHtml(h.fingerprint.pub_ip)}</a>` : '<code>N/A</code>'}\n` +
+        `<b>WebRTC IP:</b> ${h.fingerprint.webrtc_ip ? `<a href="https://ippure.com/?ip=${escapeHtml(h.fingerprint.webrtc_ip)}">${escapeHtml(h.fingerprint.webrtc_ip)}</a>` : '<code>N/A</code>'}\n` +
         `<b>采集时间:</b> <code>${escapeHtml(
           formatTimestamp(
             h.fingerprint.created_at
@@ -6306,6 +6336,19 @@ async function handleConfigCallback(
     return;
   }
 
+  if (action === 'clear') {
+    if (key === 'verif_q') {
+      await setConfig('verif_q', '', env);
+      await showBaseMenu(
+        chatId,
+        env,
+        message.message_id
+      );
+    }
+
+    return;
+  }
+
   if (action === 'edit') {
     const editableKeys = new Set([
       'welcome_msg',
@@ -6346,7 +6389,7 @@ async function handleConfigCallback(
     } else if (key === 'verif_q') {
       prompt =
         '请发送验证问题（用户验证时需要回答的问题）：\n' +
-        '留空发送可清除验证问题。';
+        '发送「清除」二字可清除验证问题。';
     } else if (key === 'verif_a') {
       prompt =
         '请发送验证答案（多个可选答案用 | 分隔）：';

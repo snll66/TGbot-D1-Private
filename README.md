@@ -1,92 +1,53 @@
-## 🚀 Telegram 双向机器人（Cloudflare Workers + D1）
+# TGbot-D1-Private
 
-基于 Cloudflare Workers 和 D1 数据库的 Telegram 双向中继机器人。将用户私聊消息转发到管理员群组的话题（Topic）中，管理员在话题中回复即可中继回用户。集成 **Cloudflare Turnstile 人机验证** 和 **静默指纹采集**，有效防止机器人滥用。
+基于 Cloudflare Workers + D1 数据库的 Telegram 入群验证与用户管理机器人。
 
----
-
-### 核心特性
-
-1. **双向中继与话题模式**
-   - 每个用户私聊会话转发到管理员群组的独立话题
-   - 话题名称动态显示用户昵称和 ID
-   - 管理员在话题中回复即可自动转发回用户
-
-2. **D1 数据库持久化**
-   - 使用 Cloudflare D1 (SQLite) 存储用户状态、话题 ID 和所有配置
-   - 数据库表自动迁移创建，无需手动建表
-
-3. **Cloudflare Turnstile 人机验证**
-   - 用户首次使用前需通过人机验证
-   - 验证页面模拟 Cloudflare 经典挑战界面（橙云 logo + Verifying you are human）
-   - 支持深色主题，适配 Telegram WebApp
-
-4. **静默指纹采集**
-   - 验证过程中后台静默采集设备指纹，用户无感知
-   - 采集信号：Canvas、WebGL、Audio、OS、CPU、Screen、Fonts、WebRTC 公网 IP
-   - 指纹相似度匹配（网络 + 设备信号，60% 阈值）
-   - 支持指纹标签管理和黑名单联动
-
-5. **完整的管理员配置菜单**
-   - 管理员私聊机器人发送 `/start` 进入菜单驱动的配置界面
-   - 在线编辑验证配置、屏蔽阈值、自动回复规则、关键词屏蔽等
-   - 注意是私聊 BOT，不是在群组内发送 /start
-
-6. **内容过滤与安全**
-   - 关键词黑名单，超过屏蔽阈值自动屏蔽用户
-   - 内容类型过滤：纯文本、媒体、链接、转发消息、音频/语音、贴纸/GIF
-   - Webhook 安全密钥验证，防止伪造请求
-
-7. **用户管理**
-   - 每个用户话题顶部资料卡提供一键屏蔽/解禁和置顶
-   - `/ban` 封禁、`/unban` 解禁指令
-   - `/card` 手动重建资料卡
-   - 黑名单和静音用户汇总
-
-8. **消息处理**
-   - 已编辑消息通知（修改前后对比）
-   - 消息备份群组功能
-   - 协同多账号处理（授权群组成员回复）
-   - Update 消息去重，防止重复转发
+> **声明**：本项目借鉴自开源项目 [moistrr/TGbot-D1](https://github.com/moistrr/TGbot-D1)，在其基础上进行了二次开发、功能增强与 Bug 修复，包括但不限于：WebApp initData 签名校验、指纹去重原子化、WebRTC IP 封禁、CF 人机验证开关、验证问答开关、IP 超链接查询、命令菜单 scope 分离等。感谢原作者的开源贡献。
 
 ---
 
-### 部署方式（Wrangler CLI）
+## 功能特性
 
-本项目使用 Wrangler CLI 部署，适合有一定技术基础的用户。如需 Dashboard 网页操作，可参考仓库历史版本的教程。
+- **入群验证**：Cloudflare Turnstile 人机验证 + 自定义验证问答，两者可独立开关或叠加使用
+- **设备指纹**：采集 Canvas / WebGL / Audio / 字体 / WebRTC IP 等多维度指纹，原子化去重（一个用户一条指纹）
+- **WebRTC IP 封禁**：封禁指定 IP 后，用户验证时若公网 IP 或 WebRTC IP 命中即自动拦截
+- **黑名单联动**：黑名单用户私聊或提交验证时收到明确拦截提示
+- **用户资料卡**：自动创建/刷新/重建用户资料卡，支持屏蔽、静音、置顶、查看资料
+- **管理命令菜单**：管理群显示完整管理命令，普通用户私聊仅显示 `/start`
+- **IP 查询跳转**：资料卡与指纹信息中的公网 IP / WebRTC IP 可点击跳转 ippure.com 查询
+- **自动回复 / 关键词屏蔽 / 转发过滤**：可配置的智能消息处理
 
-#### 前置准备
+---
 
-1. 注册 [Cloudflare](https://www.cloudflare.com/) 账号
-2. 创建一个 Telegram Bot（通过 [@BotFather](https://t.me/BotFather)）
-3. 创建一个超级群组并开启话题（Topics）模式
-4. 将 Bot 拉入群组并提权为管理员（需要「管理话题」权限）
-5. 安装 [Node.js](https://nodejs.org/)（18+）
+## 前置准备
 
-#### 步骤一：克隆项目
+1. **Cloudflare 账号**：注册并登录 [Cloudflare](https://dash.cloudflare.com/)
+2. **Node.js**：本地安装 Node.js 18+ 与 npm
+3. **Telegram Bot**：通过 [@BotFather](https://t.me/BotFather) 创建机器人，获取 `BOT_TOKEN`
+4. **Telegram 管理群**：创建一个超级群组（开启话题功能），将其作为管理群，获取群 ID（负数）
+5. **Cloudflare Turnstile**：在 Cloudflare 控制台创建 Turnstile 站点，获取 `Site Key` 与 `Secret Key`
+
+---
+
+## 部署流程
+
+### 1. 克隆项目
 
 ```bash
-git clone https://github.com/ya950/TGbot-D1.git
-cd TGbot-D1
+git clone <你的仓库地址>
+cd TG-bot
 npm install
 ```
 
-#### 步骤二：登录 Cloudflare
-
-```bash
-npx wrangler login
-```
-
-浏览器会打开授权页面，点击允许即可。
-
-#### 步骤三：创建 D1 数据库
+### 2. 创建 D1 数据库
 
 ```bash
 npx wrangler d1 create tg-bot-db
 ```
 
-命令会输出 `database_id`，将其填入下一步的 `wrangler.toml`。
+执行后会输出 `database_id`，将其填入下一步的 `wrangler.toml`。
 
-#### 步骤四：配置 wrangler.toml
+### 3. 配置 wrangler.toml
 
 编辑项目根目录的 `wrangler.toml`：
 
@@ -97,170 +58,191 @@ compatibility_date = "2026-07-01"
 
 [vars]
 ADMIN_IDS = "你的Telegram用户ID"
-ADMIN_GROUP_ID = "-100你的超级群组ID"
+ADMIN_GROUP_ID = "你的管理群ID（负数，如 -100xxxxxxxxxx）"
 APP_BASE_URL = "https://你的Worker域名"
-BOT_USERNAME = "你的Bot用户名"
+BOT_USERNAME = "你的机器人用户名（不带@）"
 
+# D1 数据库绑定，变量名必须严格为 TG_BOT_DB（代码读取 env.TG_BOT_DB）
 [[d1_databases]]
 binding = "TG_BOT_DB"
 database_name = "tg-bot-db"
-database_id = "步骤三获取的database_id"
+database_id = "上一步获取的database_id"
 ```
 
-> 获取你的用户 ID：私聊 [@nmbot](https://t.me/nmbot) 发送 `/id`
-> 获取群组 ID：将 @nmbot 拉入群组发送 `/id`（必须 -100 开头）
+> **说明**：`ADMIN_IDS` 为主管理员 Telegram 用户 ID（可填多个，逗号分隔）。`APP_BASE_URL` 为 Worker 部署后的访问域名（首次部署后可从 Cloudflare 控制台获取，再回填此处重新部署）。
 
-#### 步骤五：创建 Cloudflare Turnstile 验证组件
+### 4. 配置机密变量
 
-1. 登录 Cloudflare Dashboard → Turnstile
-2. 点击添加组件，名称随意（如 `tg-bot-verify`）
-3. **模式选择 Managed**（重要：不要选 Invisible，否则不显示验证界面）
-4. 域名填入你的 Worker 域名
-5. 创建后获取 **Site Key** 和 **Secret Key**
-
-#### 步骤六：设置 Secrets
+以下变量属于敏感信息，**不要**写入 `wrangler.toml`，通过 `wrangler secret put` 单独配置：
 
 ```bash
 # Telegram Bot Token
 npx wrangler secret put BOT_TOKEN
-# 粘贴你的 Bot Token
 
-# Webhook 密钥（随机字符串，自己生成）
-npx wrangler secret put WEBHOOK_SECRET
-# 粘贴一个随机字符串，如：mySecretKey123456
-
-# Turnstile Site Key
-npx wrangler secret put TURNSTILE_SITE_KEY
-# 粘贴步骤五获取的 Site Key
-
-# Turnstile Secret Key
+# Cloudflare Turnstile 密钥
 npx wrangler secret put TURNSTILE_SECRET_KEY
-# 粘贴步骤五获取的 Secret Key
+
+# Cloudflare Turnstile 站点密钥
+npx wrangler secret put TURNSTILE_SITE_KEY
+
+# Webhook 密钥（自定义一个随机字符串）
+npx wrangler secret put WEBHOOK_SECRET
 ```
 
-#### 步骤七：部署
+每条命令执行后会提示输入对应值，输入后回车即可。
+
+### 5. 部署到 Cloudflare Workers
 
 ```bash
 npx wrangler deploy
 ```
 
-部署成功后会输出 Worker URL，如 `https://tgbot-d1.你的子域.workers.dev`。
+部署成功后会输出 Worker 域名，形如 `https://tgbot-d1.<你的子域>.workers.dev`。将该域名回填到 `wrangler.toml` 的 `APP_BASE_URL`，再次部署一次。
 
-#### 步骤八：绑定自定义域名（可选但推荐）
+### 6. 配置 Webhook
 
-1. Cloudflare Dashboard → Workers & Pages → 你的 Worker → 设置 → 触发器 → 自定义域
-2. 添加自定义域名（需该域名在 Cloudflare 托管）
-3. 将 `wrangler.toml` 中的 `APP_BASE_URL` 更新为自定义域名并重新部署
+部署完成后，向 Telegram 注册 Webhook。**注意必须订阅 `message_reaction` 事件**（用于检测自赞等行为联动）：
 
-#### 步骤九：设置 Webhook
-
-在浏览器中访问以下 URL 完成设置（替换尖括号内容）：
-
-```
-https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=<你的Worker_URL>/webhook&secret_token=<你的WEBHOOK_SECRET>
-```
-
-返回 `{"ok":true,"result":true,"description":"Webhook was set"}` 即成功。
-
----
-
-### 配置项总览
-
-| 配置项 | 类型 | 说明 |
-|---|---|---|
-| `BOT_TOKEN` | Secret | Telegram Bot Token |
-| `WEBHOOK_SECRET` | Secret | Webhook 验证密钥（随机字符串） |
-| `TURNSTILE_SITE_KEY` | Secret | Turnstile 组件 Site Key |
-| `TURNSTILE_SECRET_KEY` | Secret | Turnstile 组件 Secret Key |
-| `ADMIN_IDS` | Var | 管理员用户 ID，多个用英文逗号分隔 |
-| `ADMIN_GROUP_ID` | Var | 管理员超级群组 ID（-100 开头） |
-| `APP_BASE_URL` | Var | Worker 的访问地址（用于验证页 URL） |
-| `BOT_USERNAME` | Var | Bot 用户名（不带 @） |
-| `TG_BOT_DB` | D1 Binding | D1 数据库绑定（必须叫这个名字） |
-
----
-
-### 数据库表说明
-
-数据库表在首次运行时**自动创建**，无需手动建表。包含以下表：
-
-| 表名 | 用途 |
-|---|---|
-| `users` | 用户信息、话题 ID、状态、屏蔽计数 |
-| `config` | 系统配置（键值对） |
-| `messages` | 消息记录（用户ID、消息ID、文本、时间） |
-| `processed_updates` | Update 去重记录 |
-| `verify_sessions` | 验证会话（session_id、user_id、状态、过期时间） |
-| `fingerprints` | 用户指纹记录（Canvas、WebGL、Audio、OS、CPU等） |
-| `fingerprint_tags` | 指纹标签（标记可疑指纹） |
-| `blacklist` | 黑名单记录 |
-
----
-
-### 管理员指令
-
-| 指令 | 说明 |
-|---|---|
-| `/start` | 私聊 Bot 进入配置菜单 |
-| `/ban` | 封禁用户 |
-| `/unban` | 解禁用户 |
-| `/card` | 重建当前话题资料卡 |
-| `/card 用户ID` | 重新绑定用户并创建资料卡 |
-| `/admin` | 管理员命令（验证审批/拒绝、黑名单、指纹标签） |
-| `/cancel` | 取消当前配置编辑操作 |
-
----
-
-### 常见问题
-
-**Q: 点击验证出现白屏？**
-A: Telegram WebView 打开瞬间有短暂白屏是客户端行为。页面 HTML 加载后会立即显示深色背景。如白屏时间过长，检查 Worker 域名是否可访问。
-
-**Q: Turnstile 验证框不显示？**
-A: 确认 Turnstile 组件模式是 **Managed**，不是 Invisible。Invisible 模式会静默通过不显示界面。
-
-**Q: 验证失败提示重试？**
-A: 检查 `TURNSTILE_SITE_KEY` 和 `TURNSTILE_SECRET_KEY` 是否匹配同一个 Turnstile 组件。
-
-**Q: 私聊 Bot /start 没反应？**
-A: 检查 `BOT_TOKEN` 是否正确。
-
-**Q: 回复用户消息没反应？**
-A: 检查 `ADMIN_IDS` 是否包含你的用户 ID。
-
-**Q: 配置菜单报 ERROR？**
-A: 检查 D1 数据库绑定，变量名必须为 `TG_BOT_DB`。
-
-**Q: 创建话题失败提示无法连接客服？**
-A: 三个可能：Bot 提权失败（重新提权）、群组 ID 不对（用 @nmbot 获取）、群组不是超级群组（ID 不 -100 开头则删除重建）。
-
----
-
-### 项目结构
-
-```
-TGbot-D1/
-├── src/
-│   └── index.js          # 主程序（Hono 框架，Workers 入口）
-├── package.json          # 依赖配置
-├── wrangler.toml         # Cloudflare Workers 配置
-├── .gitignore
-└── README.md
+```bash
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://你的Worker域名/webhook/<WEBHOOK_SECRET>",
+    "allowed_updates": [
+      "message",
+      "edited_message",
+      "callback_query",
+      "message_reaction"
+    ]
+  }'
 ```
 
+将 `<BOT_TOKEN>`、`你的Worker域名`、`<WEBHOOK_SECRET>` 替换为实际值。
+
+验证 Webhook 是否注册成功：
+
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
+```
+
+### 7. 数据库初始化
+
+数据库表会在 Worker 首次启动时**自动创建**（`dbMigrate` / `EnsureMigration` 自动执行），无需手动执行 SQL。
+
+Worker 启动时会自动创建以下 9 张表与索引：
+
+| 表名 | 用途 | 关键字段 |
+|------|------|----------|
+| `config` | 运行时配置（欢迎消息、验证问答、开关等） | `key` PK, `value` |
+| `users` | 用户状态记录 | `user_id` PK, `user_state`, `is_blocked`, `is_muted`, `topic_id`, `info_card_message_id`, `user_info_json` |
+| `messages` | 用户消息归档 | `(user_id, message_id)` PK, `text`, `date` |
+| `processed_updates` | Update 去重（防重复处理） | `update_id` PK |
+| `verify_sessions` | 验证会话 | `session_id` PK, `user_id`, `status`, `fingerprint_id`, `expires_at` |
+| `fingerprints` | 设备指纹（每用户一条，原子 upsert 去重） | `id` PK, `user_id`（唯一索引）, `pub_ip`, `webrtc_ip`, `device_json`, `device_hash` |
+| `fingerprint_tags` | 指纹标签 | `id` PK, `fingerprint_id`, `tag`, `note` |
+| `blacklist` | 用户黑名单 | `user_id` PK, `reason`, `source` |
+| `banned_ips` | IP 封禁列表（公网 IP + WebRTC IP） | `ip` PK, `reason` |
+
+**自动创建的索引**：`idx_users_topic_id`、`idx_messages_date`、`idx_processed_updates_time`、`idx_verify_sessions_user`、`idx_fingerprints_user`、`idx_fingerprints_user_hash`、`idx_fingerprint_tags_fp`，以及 `fingerprints(user_id)` 唯一索引（用于原子去重）。
+
+**迁移兼容**：`dbMigrate` 还会通过 `ensureUserColumn` 自动为旧库补齐 `topic_creating`、`topic_lock_at` 等新增列，无需手动 ALTER。
+
+如需手动初始化或重置，可创建 `schema.sql`（内容参考上面的建表语句）后执行：
+
+```bash
+npx wrangler d1 execute tg-bot-db --remote --file=./schema.sql
+```
+
+查看现有表结构：
+
+```bash
+npx wrangler d1 execute tg-bot-db --remote --command "SELECT name FROM sqlite_master WHERE type='table'"
+```
+
+查看表数据（示例）：
+
+```bash
+npx wrangler d1 execute tg-bot-db --remote --command "SELECT user_id, user_state, is_blocked FROM users LIMIT 10"
+```
+
+### 8. 配置 Cloudflare Turnstile
+
+1. 登录 Cloudflare 控制台 → Turnstile
+2. 添加站点，域名填入你的 Worker 域名
+3. 获取 `Site Key` 与 `Secret Key`
+4. 通过 `wrangler secret put` 已在第 4 步配置
+
 ---
 
-### 技术栈
+## 命令说明
 
-- **运行环境**：Cloudflare Workers
-- **Web 框架**：Hono
-- **数据库**：Cloudflare D1 (SQLite)
-- **人机验证**：Cloudflare Turnstile
-- **Telegram 交互**：原生 fetch（不依赖 telegraf）
-- **部署工具**：Wrangler CLI
+### 普通用户（私聊）
+
+| 命令 | 说明 |
+|------|------|
+| `/start` | 启动机器人 / 触发验证流程 |
+
+### 管理员（管理群）
+
+| 命令 | 说明 |
+|------|------|
+| `/start` | 启动 / 触发验证流程（可用于测试） |
+| `/ban` | 封禁当前话题用户 |
+| `/unban` | 解除当前话题用户封禁 |
+| `/delete` | 删除被回复的消息 |
+| `/terminate` | 删除当前用户话题 |
+| `/card` | 重新创建当前用户资料卡 |
+| `/admin` | 管理命令（指纹标签 / 黑名单 / IP 封禁） |
+| `/admin banip <IP> [原因]` | 添加 IP 封禁 |
+| `/admin unbanip <IP>` | 解除 IP 封禁 |
+| `/admin baniplist` | 查看封禁 IP 列表 |
+| `/testverify [用户ID]` | 测试指定用户的验证流程 |
+| `/reset [用户ID]` | 重置指定用户的验证状态 |
+| `/fp [用户ID]` | 查看指定用户的指纹信息 |
+
+> 命令菜单统一注册所有管理命令（不含 `/start`），非管理员调用时由 `isAdminUser` 拦截。`/start` 可直接输入触发。
 
 ---
 
-### License
+## 配置说明
 
-MIT
+### 环境变量（wrangler.toml）
+
+| 变量 | 说明 |
+|------|------|
+| `ADMIN_IDS` | 主管理员 Telegram 用户 ID（多个用逗号分隔） |
+| `ADMIN_GROUP_ID` | 管理群 ID（负数） |
+| `APP_BASE_URL` | Worker 部署域名 |
+| `BOT_USERNAME` | 机器人用户名（不带 @） |
+
+### 机密变量（wrangler secret）
+
+| 变量 | 说明 |
+|------|------|
+| `BOT_TOKEN` | Telegram Bot Token |
+| `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile 服务端密钥 |
+| `TURNSTILE_SITE_KEY` | Cloudflare Turnstile 站点密钥 |
+| `WEBHOOK_SECRET` | Webhook 路径密钥（自定义随机字符串） |
+
+### 运行时可配置项（管理菜单）
+
+通过机器人管理菜单动态配置，存储于 D1 数据库 `config` 表：
+
+- 欢迎消息
+- CF 人机验证开关（`turnstile_enabled`）
+- 验证问题 / 验证答案
+- 自动回复规则、关键词屏蔽、转发过滤等
+
+---
+
+## 致谢
+
+- 原项目：[moistrr/TGbot-D1](https://github.com/moistrr/TGbot-D1)
+- 平台：[Cloudflare Workers](https://workers.cloudflare.com/) + [D1 数据库](https://developers.cloudflare.com/d1/)
+- 验证：[Cloudflare Turnstile](https://www.cloudflare.com/products/turnstile/)
+
+---
+
+## 许可
+
+请遵循原项目 [moistrr/TGbot-D1](https://github.com/moistrr/TGbot-D1) 的许可协议。
