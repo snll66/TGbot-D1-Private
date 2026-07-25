@@ -7,7 +7,6 @@ ADMIN_IDS = "7178051047"
 ADMIN_GROUP_ID = "-1003941218222"
 APP_BASE_URL = "https://killer.tsm.cc.cd"
 BOT_USERNAME = "Childkiller_bot"
-MONITOR_GROUP_IDS = ""
 
 # 以下为机密变量（已通过 wrangler secret 配置，勿写在此文件中）：
 #   BOT_TOKEN             — Telegram Bot Token
